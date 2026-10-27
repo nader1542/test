@@ -24,6 +24,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -33,26 +34,57 @@ import java.util.Set;
 import java.util.function.Predicate;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 /**
  * Genere le $jsonSchema MongoDB de la collection "actors" a partir du modele Java (Actor)
  * et reprend les descriptions deja presentes sur les DTO (@Schema(description = "...")).
  *
- * Comment retrouver le bon DTO / le bon champ :
- *  1. ActorMapper : on lit ses @Mapping (target/source) pour relier un chemin du modele
- *     (ex. "personalIdentity.firstName" dans ActorInActivity) a un champ de DTO plat
- *     (ex. ActorDto.firstName). Les annotations MapStruct ne sont pas visibles par reflexion
- *     (retention CLASS) : on parse donc le fichier source ActorMapper.java.
- *  2. Les autres mappers (AddressMapper, ContactMapper, ...) : decouverts par scan, ils relient
- *     une classe du modele a son DTO (champs de meme nom).
- *  3. Secours : champ de meme nom dans le DTO, puis @Schema sur le modele.
+ * <h3>Quand un fichier est-il genere ?</h3>
+ * Uniquement si le schema calcule depuis le modele (champs + descriptions) est different
+ * du dernier fichier {@code latest-x.x.x.json5} present dans le dossier des schemas.
+ * Sans modification, rien n'est ecrit.
+ *
+ * <h3>Nom du fichier</h3>
+ * {@code latest-x.x.x.json5}. La version est, dans l'ordre :
+ * <ol>
+ *   <li>donnee explicitement : {@code -Dschema.version=1.14.0} ou premier argument de {@link #main} ;</li>
+ *   <li>sinon celle du dernier fichier existant (le schema de la release en cours est mis a jour) ;</li>
+ *   <li>sinon 1.0.0 (premier schema).</li>
+ * </ol>
+ *
+ * <h3>Comment retrouver le bon DTO / le bon champ pour la description</h3>
+ * <ol>
+ *   <li>ActorMapper : on lit ses @Mapping (target/source) pour relier un chemin du modele
+ *       (ex. "personalIdentity.firstName" dans ActorInActivity) a un champ de DTO plat
+ *       (ex. ActorDto.firstName). Les annotations MapStruct ne sont pas visibles par reflexion
+ *       (retention CLASS) : on parse donc le fichier source ActorMapper.java.</li>
+ *   <li>Les autres mappers (AddressMapper, ContactMapper, ...) : decouverts par scan, ils relient
+ *       une classe du modele a son DTO (champs de meme nom).</li>
+ *   <li>Secours : champ de meme nom dans le DTO, puis @Schema sur le modele.</li>
+ * </ol>
  *
  * NB : a lancer depuis la racine du module (chemins relatifs src/main/...).
  */
 public final class SchemaExporter {
 
-    public static final Path TARGET =
-            Path.of("src/main/resources/schema/mongodb/actors/1.0.0.json5");
+    // ------------------------------------------------------------ constantes
+
+    /** Dossier des schemas Mongo de la collection "actors". */
+    public static final Path SCHEMA_DIR =
+            Path.of("src/main/resources/schema/mongodb/actors");
+
+    /** Nom des fichiers "derniere version" : latest-<major>.<minor>.<patch>.json5. */
+    private static final Pattern LATEST_FILE = Pattern.compile("latest-(\\d+)\\.(\\d+)\\.(\\d+)\\.json5");
+
+    /** Format attendu pour une version donnee en parametre. */
+    private static final Pattern VERSION = Pattern.compile("\\d+\\.\\d+\\.\\d+");
+
+    /** Version utilisee quand aucun fichier latest-* n'existe encore. */
+    private static final String INITIAL_VERSION = "1.0.0";
+
+    /** Propriete systeme pour imposer la version : -Dschema.version=1.14.0 */
+    public static final String VERSION_PROPERTY = "schema.version";
 
     /** Source de l'ActorMapper (parse pour lire les @Mapping). */
     private static final Path ACTOR_MAPPER_SOURCE = Path.of(
@@ -68,29 +100,49 @@ public final class SchemaExporter {
     private static final List<String> REQUIRED =
             List.of("_id", "type", "role", "status", "countryDatabase");
 
+    /** Format d'ecriture : JSON indente sur 4 espaces, nombres en notation "relaxed". */
     private static final JsonWriterSettings WRITER = JsonWriterSettings.builder()
             .outputMode(JsonMode.RELAXED)
             .indent(true)
             .indentCharacters("    ")
             .build();
 
-    // Parsing de ActorMapper.java
+    // Expressions pour parser ActorMapper.java
+    /** @Mapping(...) : capture le contenu des parentheses. */
     private static final Pattern MAPPING = Pattern.compile("@Mapping\\(([^)]*)\\)");
+    /** Declaration d'une methode abstraite : "Type nom(params);". */
     private static final Pattern DECLARATION =
             Pattern.compile("([\\w.<>\\[\\]]+)\\s+(\\w+)\\s*\\(([^()]*)\\)\\s*;");
     private static final Pattern ATTR_TARGET = Pattern.compile("target\\s*=\\s*\"([^\"]+)\"");
     private static final Pattern ATTR_SOURCE = Pattern.compile("source\\s*=\\s*\"([^\"]+)\"");
 
+    // ------------------------------------------------------------ types internes
+
     /** Champ de DTO (classe + nom) qui documente un champ du modele. */
     private record DtoRef(Class<?> dto, String field) {
     }
 
+    /** Un @Mapping lu dans le source : position, cible et source. */
     private record MappingEntry(int start, String target, String source) {
     }
 
+    /** Fichier latest-x.x.x.json5 existant, avec sa version decomposee pour la comparer. */
+    private record VersionedFile(Path path, int major, int minor, int patch) {
+        String version() {
+            return major + "." + minor + "." + patch;
+        }
+
+        static final Comparator<VersionedFile> BY_VERSION = Comparator
+                .comparingInt(VersionedFile::major)
+                .thenComparingInt(VersionedFile::minor)
+                .thenComparingInt(VersionedFile::patch);
+    }
+
     /**
+     * Informations partagees pendant le parcours du schema.
      * registry : classe du modele -> DTO associes (scan des mappers)
      * explicit : classe "racine" du modele (Actor, ActorInActivity) -> chemin -> champs de DTO
+     *            (lu dans les @Mapping de ActorMapper)
      */
     private record Context(Map<Class<?>, Set<Class<?>>> registry,
                            Map<Class<?>, Map<String, List<DtoRef>>> explicit) {
@@ -101,7 +153,12 @@ public final class SchemaExporter {
 
     // ------------------------------------------------------------------ API
 
+    /**
+     * Calcule le schema depuis le modele : structure Spring Data + descriptions des DTO.
+     * Retourne le document {"$jsonSchema": {...}}.
+     */
     public static Document generate() {
+        // 1. Structure (bsonType, properties, items) fournie par Spring Data MongoDB
         MongoMappingContext ctx = new MongoMappingContext();
         ctx.setSimpleTypeHolder(new MongoCustomConversions(List.of()).getSimpleTypeHolder());
         ctx.setInitialEntitySet(Set.of(Actor.class));
@@ -111,34 +168,130 @@ public final class SchemaExporter {
         Document root = schema.toDocument();
         Document jsonSchema = root.get("$jsonSchema", Document.class);
 
+        // 2. Informations pour relier modele et DTO (mappers)
         Context context = new Context(discoverMapperPairs(), parseActorMapper());
 
+        // DTO candidats a la racine : ActorDto + ceux que les mappers associent a Actor
         Set<Class<?>> rootDtos = new LinkedHashSet<>();
         rootDtos.add(ActorDto.class);
         rootDtos.addAll(context.registry().getOrDefault(Actor.class, Set.of()));
 
+        // 3. Ajout des descriptions (et uniformisation type -> bsonType)
         enrich(jsonSchema, Actor.class, rootDtos, context, Actor.class, "");
         addRootExtras(jsonSchema);
         return root;
     }
 
+    /** Schema calcule, au format texte (ce qui est ecrit dans le fichier). */
     public static String generateAsString() {
         return generate().toJson(WRITER) + System.lineSeparator();
     }
 
-    public static void export(Path target) throws IOException {
-        Files.createDirectories(target.getParent());
-        Files.writeString(target, generateAsString(), StandardCharsets.UTF_8);
+    /**
+     * Le modele a-t-il change depuis le dernier fichier latest-x.x.x.json5 ?
+     * Vrai aussi s'il n'existe encore aucun fichier.
+     */
+    public static boolean hasChanged(Path dir) throws IOException {
+        Optional<VersionedFile> latest = findLatest(dir);
+        if (latest.isEmpty()) {
+            return true;
+        }
+        return !sameSchema(latest.get().path(), generate());
     }
 
+    /**
+     * Ecrit latest-x.x.x.json5 seulement si le modele a change.
+     *
+     * @param version version imposee (x.y.z) ou null : dans ce cas on reprend celle du dernier
+     *                fichier existant, ou 1.0.0 s'il n'y en a pas
+     * @return le fichier ecrit, ou vide si le schema est deja a jour
+     */
+    public static Optional<Path> exportIfChanged(Path dir, String version) throws IOException {
+        if (version != null && !VERSION.matcher(version).matches()) {
+            throw new IllegalArgumentException("Version invalide '" + version + "' (attendu : x.y.z)");
+        }
+
+        Optional<VersionedFile> latest = findLatest(dir);
+        Document generated = generate();
+
+        // Aucun changement : on ne touche a rien
+        if (latest.isPresent() && sameSchema(latest.get().path(), generated)) {
+            return Optional.empty();
+        }
+
+        // Choix de la version : explicite > dernier fichier existant > version initiale
+        String target = version != null ? version
+                : latest.map(VersionedFile::version).orElse(INITIAL_VERSION);
+        Path file = dir.resolve("latest-" + target + ".json5");
+
+        Files.createDirectories(dir);
+        Files.writeString(file, generated.toJson(WRITER) + System.lineSeparator(), StandardCharsets.UTF_8);
+        return Optional.of(file);
+    }
+
+    /**
+     * Point d'entree : mvn exec ou execution IDE.
+     * Version : premier argument, sinon -Dschema.version, sinon deduite des fichiers existants.
+     */
     public static void main(String[] args) throws IOException {
-        Path target = args.length > 0 ? Path.of(args[0]) : TARGET;
-        export(target);
-        System.out.println("Schema ecrit dans " + target.toAbsolutePath());
+        String version = args.length > 0 ? args[0] : System.getProperty(VERSION_PROPERTY);
+
+        Optional<Path> written = exportIfChanged(SCHEMA_DIR, version);
+        if (written.isPresent()) {
+            System.out.println("Schema ecrit dans " + written.get().toAbsolutePath());
+        } else {
+            System.out.println("Schema deja a jour, aucun fichier genere.");
+        }
+    }
+
+    // ------------------------------------------- fichiers latest-x.x.x.json5
+
+    /** Retourne le fichier latest-* ayant la plus grande version (ex. 1.13.0 > 1.0.7). */
+    private static Optional<VersionedFile> findLatest(Path dir) throws IOException {
+        if (!Files.isDirectory(dir)) {
+            return Optional.empty();
+        }
+        try (Stream<Path> files = Files.list(dir)) {
+            return files
+                    .map(SchemaExporter::toVersionedFile)
+                    .flatMap(Optional::stream)
+                    .max(VersionedFile.BY_VERSION);
+        }
+    }
+
+    private static Optional<VersionedFile> toVersionedFile(Path path) {
+        Matcher m = LATEST_FILE.matcher(path.getFileName().toString());
+        if (!m.matches()) {
+            return Optional.empty(); // 1.0.0.json5, banner.txt, ... : ignores
+        }
+        return Optional.of(new VersionedFile(path,
+                Integer.parseInt(m.group(1)),
+                Integer.parseInt(m.group(2)),
+                Integer.parseInt(m.group(3))));
+    }
+
+    /**
+     * Compare le fichier existant au schema genere, de maniere semantique : on relit les deux
+     * en Document, donc l'indentation, l'ordre des cles et les guillemets n'ont pas d'importance.
+     * Si le fichier existant est illisible, on considere qu'il differe (il sera regenere).
+     */
+    private static boolean sameSchema(Path existingFile, Document generated) {
+        try {
+            Document existing = Document.parse(Files.readString(existingFile, StandardCharsets.UTF_8));
+            // Le schema genere repasse par le texte pour avoir les memes types que le fichier relu
+            Document normalized = Document.parse(generated.toJson(WRITER));
+            return existing.equals(normalized);
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     // ------------------------------------------- lecture des @Mapping de ActorMapper
 
+    /**
+     * Lit ActorMapper.java et construit : classe du modele -> chemin -> champs de DTO.
+     * Exemple : ActorInActivity -> "personalIdentity.firstName" -> [ActorDto.firstName, ...]
+     */
     private static Map<Class<?>, Map<String, List<DtoRef>>> parseActorMapper() {
         Map<Class<?>, Map<String, List<DtoRef>>> explicit = new LinkedHashMap<>();
 
@@ -150,21 +303,24 @@ public final class SchemaExporter {
                     + ACTOR_MAPPER_SOURCE.toAbsolutePath()
                     + " (lancer depuis la racine du module)", e);
         }
-        // supprime les commentaires (// Enum, // Sub-resources, ...)
+        // Supprime les commentaires (// Enum, // Sub-resources, ...) pour ne pas gener le parsing
         source = source.replaceAll("(?s)/\\*.*?\\*/", "").replaceAll("//[^\\n]*", "");
 
+        // Etape 1 : tous les @Mapping avec target ET source (ignore = true n'a rien a documenter)
         List<MappingEntry> mappings = new ArrayList<>();
         Matcher mm = MAPPING.matcher(source);
         while (mm.find()) {
             String attributes = mm.group(1);
             String target = firstGroup(ATTR_TARGET, attributes);
             String src = firstGroup(ATTR_SOURCE, attributes);
-            if (target != null && src != null) { // ignore = true sans source : sans interet
+            if (target != null && src != null) {
                 mappings.add(new MappingEntry(mm.start(), target, src));
             }
         }
 
-        // Les @Mapping precedent la methode abstraite qu'ils decrivent.
+        // Etape 2 : les @Mapping precedent la methode abstraite qu'ils decrivent.
+        // Pour chaque declaration "Type nom(params);", on prend les @Mapping situes entre la
+        // declaration precedente et celle-ci.
         Matcher dm = DECLARATION.matcher(source);
         int previousEnd = 0;
         while (dm.find()) {
@@ -184,7 +340,8 @@ public final class SchemaExporter {
             }
         }
 
-        // Valeurs posees dans les @AfterMapping (enums) : pas de @Mapping a lire.
+        // Etape 3 : valeurs posees dans les @AfterMapping (enums) : aucun @Mapping a lire,
+        // on declare le lien a la main. A mettre a jour si ces champs sont renommes.
         Method toModel = findMapperMethod("toModel");
         if (toModel != null) {
             Class<?> activity = toModel.getReturnType();
@@ -199,6 +356,11 @@ public final class SchemaExporter {
         return explicit;
     }
 
+    /**
+     * Enregistre un @Mapping selon le sens de la methode :
+     * DTO -> modele : target = chemin du modele, source = champ du DTO
+     * modele -> DTO : target = champ du DTO, source = "<parametre>.<chemin du modele>"
+     */
     private static void register(Map<Class<?>, Map<String, List<DtoRef>>> explicit,
                                  Method method,
                                  List<String> paramNames,
@@ -207,14 +369,13 @@ public final class SchemaExporter {
         Class<?>[] params = method.getParameterTypes();
 
         if (isModel(returned)) {
-            // DTO -> modele : target = chemin modele, source = champ du DTO
             for (Class<?> param : params) {
                 if (isDto(param)) {
                     addExplicit(explicit, returned, entry.target(), param, entry.source());
                 }
             }
         } else if (isDto(returned)) {
-            // modele -> DTO : target = champ du DTO, source = "<parametre>.<chemin modele>"
+            // "activity.personalIdentity.firstName" -> parametre "activity" + chemin du modele
             int dot = entry.source().indexOf('.');
             if (dot < 0) {
                 return;
@@ -240,6 +401,7 @@ public final class SchemaExporter {
         }
     }
 
+    /** Retrouve par reflexion la methode de ActorMapper portant ce nom. */
     private static Method findMapperMethod(String name) {
         for (Method m : ActorMapper.class.getMethods()) {
             if (m.getName().equals(name)) {
@@ -268,6 +430,7 @@ public final class SchemaExporter {
         return c != null && c.getName().startsWith(MODEL_PACKAGE);
     }
 
+    /** Un DTO = classe applicative hors modele, dans un package ".dto." ou nommee "...Dto". */
     private static boolean isDto(Class<?> c) {
         return c != null
                 && c.getName().startsWith(BASE_PACKAGE)
@@ -284,11 +447,12 @@ public final class SchemaExporter {
     private static Map<Class<?>, Set<Class<?>>> discoverMapperPairs() {
         Map<Class<?>, Set<Class<?>>> result = new LinkedHashMap<>();
 
+        // Scanner classpath qui accepte aussi les interfaces (les mappers MapStruct en sont)
         ClassPathScanningCandidateComponentProvider scanner =
                 new ClassPathScanningCandidateComponentProvider(false) {
                     @Override
                     protected boolean isCandidateComponent(AnnotatedBeanDefinition beanDefinition) {
-                        return beanDefinition.getMetadata().isIndependent(); // autorise les interfaces
+                        return beanDefinition.getMetadata().isIndependent();
                     }
                 };
         scanner.addIncludeFilter(new RegexPatternTypeFilter(Pattern.compile(".*Mapper$")));
@@ -303,6 +467,7 @@ public final class SchemaExporter {
             }
 
             for (Method method : mapper.getMethods()) {
+                // Type de retour + types des parametres de la methode
                 List<Type> types = new ArrayList<>();
                 types.add(method.getGenericReturnType());
                 types.addAll(Arrays.asList(method.getGenericParameterTypes()));
@@ -317,6 +482,7 @@ public final class SchemaExporter {
                         dtos.add(c);
                     }
                 }
+                // Chaque classe du modele est reliee aux DTO vus dans la meme methode
                 for (Class<?> model : models) {
                     result.computeIfAbsent(model, k -> new LinkedHashSet<>()).addAll(dtos);
                 }
@@ -342,6 +508,7 @@ public final class SchemaExporter {
 
     // ------------------------------------------------------- post-traitement
 
+    /** Ajoute ce que le creator Spring ne produit pas : "required" et le champ "_class". */
     private static void addRootExtras(Document jsonSchema) {
         jsonSchema.put("required", new ArrayList<>(REQUIRED));
 
@@ -352,11 +519,14 @@ public final class SchemaExporter {
     }
 
     /**
-     * Parcourt le schema en parallele du modele.
+     * Parcourt le schema en parallele du modele et ajoute "description" a chaque propriete.
      *
-     * @param scope classe "racine" courante (Actor ou ActorInActivity) : les chemins des @Mapping
-     *              sont relatifs a elle
-     * @param path  chemin du noeud courant depuis scope (ex. "personalIdentity")
+     * @param node          noeud du schema en cours (objet ou items de tableau)
+     * @param modelClass    classe du modele correspondant a ce noeud
+     * @param dtoCandidates DTO susceptibles de documenter ce noeud (champs de meme nom)
+     * @param scope         classe "racine" courante (Actor ou ActorInActivity) : les chemins des
+     *                      @Mapping sont relatifs a elle
+     * @param path          chemin du noeud courant depuis scope (ex. "personalIdentity")
      */
     private static void enrich(Document node,
                                Class<?> modelClass,
@@ -380,12 +550,14 @@ public final class SchemaExporter {
 
             Field modelField = findModelField(modelClass, propName);
             if (modelField == null) {
-                continue;
+                continue; // propriete sans champ Java (ex. _class) : rien a documenter
             }
 
+            // Chemin complet du champ depuis la classe racine, ex. "personalIdentity.firstName"
             String key = path.isEmpty() ? modelField.getName() : path + "." + modelField.getName();
             List<Field> dtoFields = resolveDtoFields(ctx, scope, key, dtoCandidates, modelField.getName());
 
+            // Description : premier @Schema(description) trouve sur les DTO, sinon sur le modele
             String description = null;
             for (Field f : dtoFields) {
                 description = descriptionOf(f);
@@ -394,12 +566,13 @@ public final class SchemaExporter {
                 }
             }
             if (description == null) {
-                description = descriptionOf(modelField); // fallback : @Schema sur le modele
+                description = descriptionOf(modelField);
             }
             if (description != null) {
                 prop.put("description", description);
             }
 
+            // Descente dans les objets et les tableaux d'objets
             Object bsonType = prop.get("bsonType");
             if ("object".equals(bsonType)) {
                 descend(prop, modelField.getType(), dtoFields, false, ctx, scope, key);
@@ -422,6 +595,7 @@ public final class SchemaExporter {
                                                 Set<Class<?>> dtoCandidates, String javaName) {
         List<Field> fields = new ArrayList<>();
 
+        // 1. Lien explicite lu dans ActorMapper
         List<DtoRef> refs = ctx.explicit()
                 .getOrDefault(scope, Map.of())
                 .getOrDefault(key, List.of());
@@ -431,6 +605,7 @@ public final class SchemaExporter {
                 fields.add(f);
             }
         }
+        // 2. Champ de meme nom dans les DTO candidats
         for (Class<?> dto : dtoCandidates) {
             Field f = findDtoField(dto, javaName);
             if (f != null && !fields.contains(f)) {
@@ -440,15 +615,18 @@ public final class SchemaExporter {
         return fields;
     }
 
+    /** Descend dans un sous-objet (ou element de liste) en preparant ses DTO candidats. */
     private static void descend(Document node, Class<?> childModel, List<Field> dtoFields,
                                 boolean element, Context ctx, Class<?> scope, String key) {
+        // DTO du sous-objet : type des champs DTO trouves + DTO connus des mappers
         Set<Class<?>> children = new LinkedHashSet<>();
         for (Field f : dtoFields) {
             addCandidate(children, element ? elementType(f.getGenericType()) : f.getType());
         }
         children.addAll(ctx.registry().getOrDefault(childModel, Set.of()));
 
-        // Une classe qui a ses propres @Mapping (ex. ActorInActivity) ouvre un nouveau scope.
+        // Une classe qui a ses propres @Mapping (ex. ActorInActivity) ouvre un nouveau scope :
+        // ses chemins repartent de zero.
         boolean newScope = ctx.explicit().containsKey(childModel);
         enrich(node, childModel, children, ctx,
                 newScope ? childModel : scope,
@@ -484,6 +662,7 @@ public final class SchemaExporter {
         node.putAll(rest);
     }
 
+    /** Valeur de @Schema(description) sur un champ, ou null si absente / vide. */
     private static String descriptionOf(Field field) {
         if (field == null) {
             return null;
@@ -491,6 +670,8 @@ public final class SchemaExporter {
         Schema schema = field.getAnnotation(Schema.class);
         return schema != null && !schema.description().isBlank() ? schema.description() : null;
     }
+
+    // ------------------------------------------------------- recherche de champs
 
     /** Champ du modele : par nom Java ou par nom Mongo (@Field, @Id -> _id). */
     private static Field findModelField(Class<?> type, String mongoName) {
@@ -508,6 +689,7 @@ public final class SchemaExporter {
         });
     }
 
+    /** Premier champ non statique repondant au critere, en remontant les classes parentes. */
     private static Field findField(Class<?> type, Predicate<Field> matcher) {
         for (Class<?> c = type; c != null && c != Object.class; c = c.getSuperclass()) {
             for (Field f : c.getDeclaredFields()) {
@@ -519,6 +701,7 @@ public final class SchemaExporter {
         return null;
     }
 
+    /** Nom du champ dans Mongo : @Field(name/value), "_id" pour l'identifiant, sinon nom Java. */
     private static String mongoName(Field f) {
         org.springframework.data.mongodb.core.mapping.Field a =
                 f.getAnnotation(org.springframework.data.mongodb.core.mapping.Field.class);
@@ -534,6 +717,7 @@ public final class SchemaExporter {
         return f.getName();
     }
 
+    /** Type des elements d'une List<X> / Set<X> : X (ou son type brut si generique). */
     private static Class<?> elementType(Type generic) {
         if (generic instanceof ParameterizedType p && p.getActualTypeArguments().length == 1) {
             Type arg = p.getActualTypeArguments()[0];

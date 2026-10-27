@@ -1,34 +1,37 @@
-import org.bson.Document;
+
 import org.junit.jupiter.api.Test;
 
-import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Optional;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 
 /**
- * Garde-fou : le schema commite doit rester synchronise avec le modele Java.
+ * Garde-fou : le dernier schema commite (latest-x.x.x.json5) doit rester synchronise avec le
+ * modele Java et les descriptions des DTO.
  *
- * Pour regenerer le fichier :
+ * Pour regenerer (ne cree un fichier que si le modele a change) :
  *   mvn test -Dtest=SchemaExporterTest -Dschema.update=true
+ * Pour imposer la version du fichier genere :
+ *   mvn test -Dtest=SchemaExporterTest -Dschema.update=true -Dschema.version=1.14.0
  */
 class SchemaExporterTest {
 
     @Test
-    void committed_schema_should_match_java_model() throws Exception {
-        Path file = SchemaExporter.TARGET;
+    void latest_schema_should_match_java_model() throws Exception {
+        Path dir = SchemaExporter.SCHEMA_DIR;
 
-        if (Boolean.getBoolean("schema.update") || Files.notExists(file)) {
-            SchemaExporter.export(file);
+        // Mode mise a jour : on genere (si besoin) et on s'arrete
+        if (Boolean.getBoolean("schema.update")) {
+            Optional<Path> written = SchemaExporter.exportIfChanged(
+                    dir, System.getProperty(SchemaExporter.VERSION_PROPERTY));
+            written.ifPresent(file -> System.out.println("Schema ecrit : " + file));
             return;
         }
 
-        // Document.parse accepte cles non quotees et quotes simples (format json5 du projet)
-        Document expected = Document.parse(Files.readString(file));
-        Document actual = SchemaExporter.generate();
-
-        assertEquals(expected.toJson(), actual.toJson(),
+        // Mode controle (CI) : echec si le modele a change sans nouveau schema commite
+        assertFalse(SchemaExporter.hasChanged(dir),
                 "Le schema Mongo est desynchronise du modele. "
-                        + "Relancer avec -Dschema.update=true puis commiter 1.0.0.json5");
+                        + "Relancer avec -Dschema.update=true puis commiter le fichier latest-x.x.x.json5");
     }
 }
