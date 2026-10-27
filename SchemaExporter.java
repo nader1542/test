@@ -40,18 +40,20 @@ import java.util.stream.Stream;
  * Genere le $jsonSchema MongoDB de la collection "actors" a partir du modele Java (Actor)
  * et reprend les descriptions deja presentes sur les DTO (@Schema(description = "...")).
  *
- * <h3>Quand un fichier est-il genere ?</h3>
+ * <h3>Quand un fichier est-il cree ?</h3>
  * Uniquement si le schema calcule depuis le modele (champs + descriptions) est different
  * du dernier fichier {@code latest-x.x.x.json5} present dans le dossier des schemas.
- * Sans modification, rien n'est ecrit.
+ * Sans modification, rien n'est cree.
  *
  * <h3>Nom du fichier</h3>
- * {@code latest-x.x.x.json5}. La version est, dans l'ordre :
- * <ol>
- *   <li>donnee explicitement : {@code -Dschema.version=1.14.0} ou premier argument de {@link #main} ;</li>
- *   <li>sinon celle du dernier fichier existant (le schema de la release en cours est mis a jour) ;</li>
- *   <li>sinon 1.0.0 (premier schema).</li>
- * </ol>
+ * Chaque modification cree un nouveau fichier {@code latest-x.x.x.json5}. La version est :
+ * <ul>
+ *   <li>automatique par defaut : celle du dernier fichier + 1 sur le patch
+ *       (latest-1.13.0 -> latest-1.13.1), ou 1.0.0 s'il n'y en a pas ;</li>
+ *   <li>manuelle si on la donne : {@code -Dschema.version=1.14.0} ou premier argument de
+ *       {@link #main} (elle doit etre superieure a la derniere version existante).</li>
+ * </ul>
+ * Les fichiers existants ne sont jamais modifies ni supprimes.
  *
  * <h3>Comment retrouver le bon DTO / le bon champ pour la description</h3>
  * <ol>
@@ -77,13 +79,13 @@ public final class SchemaExporter {
     /** Nom des fichiers "derniere version" : latest-<major>.<minor>.<patch>.json5. */
     private static final Pattern LATEST_FILE = Pattern.compile("latest-(\\d+)\\.(\\d+)\\.(\\d+)\\.json5");
 
-    /** Format attendu pour une version donnee en parametre. */
+    /** Format d'une version choisie a la main : x.y.z */
     private static final Pattern VERSION = Pattern.compile("\\d+\\.\\d+\\.\\d+");
 
-    /** Version utilisee quand aucun fichier latest-* n'existe encore. */
+    /** Version du premier fichier, quand aucun latest-* n'existe encore. */
     private static final String INITIAL_VERSION = "1.0.0";
 
-    /** Propriete systeme pour imposer la version : -Dschema.version=1.14.0 */
+    /** Propriete systeme pour choisir la version a la main : -Dschema.version=1.14.0 */
     public static final String VERSION_PROPERTY = "schema.version";
 
     /** Source de l'ActorMapper (parse pour lire les @Mapping). */
@@ -130,6 +132,17 @@ public final class SchemaExporter {
     private record VersionedFile(Path path, int major, int minor, int patch) {
         String version() {
             return major + "." + minor + "." + patch;
+        }
+
+        /** Version du fichier suivant en mode automatique : on incremente le patch (1.13.0 -> 1.13.1). */
+        String nextVersion() {
+            return major + "." + minor + "." + (patch + 1);
+        }
+
+        /** Version "x.y.z" -> VersionedFile sans chemin, uniquement pour la comparer. */
+        static VersionedFile parse(String version) {
+            String[] p = version.split("\\.");
+            return new VersionedFile(null, Integer.parseInt(p[0]), Integer.parseInt(p[1]), Integer.parseInt(p[2]));
         }
 
         static final Comparator<VersionedFile> BY_VERSION = Comparator
@@ -199,29 +212,53 @@ public final class SchemaExporter {
         return !sameSchema(latest.get().path(), generate());
     }
 
+    /** Version automatique : voir {@link #exportIfChanged(Path, String)}. */
+    public static Optional<Path> exportIfChanged(Path dir) throws IOException {
+        return exportIfChanged(dir, null);
+    }
+
     /**
-     * Ecrit latest-x.x.x.json5 seulement si le modele a change.
+     * Cree un NOUVEAU fichier latest-x.x.x.json5 seulement si le modele a change.
+     * Les fichiers existants ne sont jamais modifies ni supprimes : ils gardent l'historique.
      *
-     * @param version version imposee (x.y.z) ou null : dans ce cas on reprend celle du dernier
-     *                fichier existant, ou 1.0.0 s'il n'y en a pas
-     * @return le fichier ecrit, ou vide si le schema est deja a jour
+     * @param version version choisie a la main (ex. "1.14.0"), ou null / vide pour la laisser
+     *                automatique : version du dernier fichier + 1 sur le patch (1.13.0 -> 1.13.1),
+     *                ou 1.0.0 s'il n'y a encore aucun fichier
+     * @return le fichier cree, ou vide si le schema est deja a jour
+     * @throws IllegalArgumentException si la version manuelle est mal formee ou n'est pas
+     *                                  strictement superieure a celle du dernier fichier
      */
     public static Optional<Path> exportIfChanged(Path dir, String version) throws IOException {
-        if (version != null && !VERSION.matcher(version).matches()) {
+        // Une version vide (propriete Maven non renseignee) equivaut a "pas de version manuelle"
+        if (version != null && version.isBlank()) {
+            version = null;
+        }
+        if (version != null && !VERSION.matcher(version.trim()).matches()) {
             throw new IllegalArgumentException("Version invalide '" + version + "' (attendu : x.y.z)");
         }
 
         Optional<VersionedFile> latest = findLatest(dir);
         Document generated = generate();
 
-        // Aucun changement : on ne touche a rien
+        // Aucun changement par rapport au dernier schema : on ne cree rien
         if (latest.isPresent() && sameSchema(latest.get().path(), generated)) {
             return Optional.empty();
         }
 
-        // Choix de la version : explicite > dernier fichier existant > version initiale
-        String target = version != null ? version
-                : latest.map(VersionedFile::version).orElse(INITIAL_VERSION);
+        String target;
+        if (version != null) {
+            // Version manuelle : doit etre posterieure au dernier fichier (jamais d'ecrasement)
+            target = version.trim();
+            if (latest.isPresent() && VersionedFile.BY_VERSION.compare(
+                    VersionedFile.parse(target), latest.get()) <= 0) {
+                throw new IllegalArgumentException("La version " + target
+                        + " doit etre superieure a la derniere version existante "
+                        + latest.get().version());
+            }
+        } else {
+            // Version automatique : 1.13.0 -> 1.13.1 (ou 1.0.0 pour le premier fichier)
+            target = latest.map(VersionedFile::nextVersion).orElse(INITIAL_VERSION);
+        }
         Path file = dir.resolve("latest-" + target + ".json5");
 
         Files.createDirectories(dir);
@@ -230,8 +267,9 @@ public final class SchemaExporter {
     }
 
     /**
-     * Point d'entree : mvn exec ou execution IDE.
-     * Version : premier argument, sinon -Dschema.version, sinon deduite des fichiers existants.
+     * Point d'entree : mvn exec:java ou execution IDE.
+     * Version manuelle optionnelle : premier argument, ou -Dschema.version=1.14.0.
+     * Sans version, le nom est automatique.
      */
     public static void main(String[] args) throws IOException {
         String version = args.length > 0 ? args[0] : System.getProperty(VERSION_PROPERTY);
