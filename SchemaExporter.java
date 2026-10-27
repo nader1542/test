@@ -1,3 +1,7 @@
+package com.rcibs.rdv.api.business.corp.schema;
+
+import com.rcibs.rdv.api.business.corp.service.actors.dto.ActorDto;
+import com.rcibs.rdv.api.core.model.actor.Actor;
 import io.swagger.v3.oas.annotations.media.Schema;
 import org.bson.Document;
 import org.bson.json.JsonMode;
@@ -93,6 +97,7 @@ public final class SchemaExporter {
      * dtoClass peut etre null (pas de DTO equivalent) : on tente alors @Schema du modele.
      */
     private static void enrich(Document node, Class<?> modelClass, Class<?> dtoClass) {
+        normalizeType(node);
         Document props = node.get("properties", Document.class);
         if (props == null) {
             return;
@@ -100,7 +105,14 @@ public final class SchemaExporter {
         for (String propName : new ArrayList<>(props.keySet())) {
             Document prop = props.get(propName, Document.class);
             Field modelField = findModelField(modelClass, propName);
-            if (prop == null || modelField == null) {
+            if (prop == null) {
+                continue;
+            }
+            // Le creator Spring emet "type": "string|array|object" (JSON Schema) pour les types
+            // simples et "bsonType" pour les autres : on uniformise AVANT de lire le type,
+            // sinon la descente dans les listes/objets imbriques est sautee.
+            normalizeType(prop);
+            if (modelField == null) {
                 continue;
             }
 
@@ -119,6 +131,9 @@ public final class SchemaExporter {
                 enrich(prop, modelField.getType(), dtoField == null ? null : dtoField.getType());
             } else if ("array".equals(bsonType)) {
                 Document items = prop.get("items", Document.class);
+                if (items != null) {
+                    normalizeType(items);
+                }
                 Class<?> modelElement = elementType(modelField.getGenericType());
                 Class<?> dtoElement = dtoField == null ? null : elementType(dtoField.getGenericType());
                 if (items != null && modelElement != null) {
@@ -126,6 +141,28 @@ public final class SchemaExporter {
                 }
             }
         }
+    }
+
+    /**
+     * Remplace "type": "xxx" par "bsonType": "xxx" (convention du schema existant),
+     * en conservant l'ordre des cles. Ne touche qu'a un noeud de schema : une propriete
+     * metier nommee "type" vit dans "properties" sous forme de Document, jamais de String.
+     */
+    private static void normalizeType(Document node) {
+        if (node == null || !(node.get("type") instanceof String jsonType)) {
+            return;
+        }
+        String bson = switch (jsonType) {
+            case "integer" -> "int";
+            case "number" -> "double";
+            default -> jsonType;
+        };
+        Document rest = new Document(node);
+        rest.remove("type");
+        rest.remove("bsonType");
+        node.clear();
+        node.put("bsonType", bson);
+        node.putAll(rest);
     }
 
     private static String descriptionOf(Field field) {
