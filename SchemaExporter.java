@@ -6,6 +6,7 @@ import org.springframework.beans.factory.annotation.AnnotatedBeanDefinition;
 import org.springframework.beans.factory.config.BeanDefinition;
 import org.springframework.context.annotation.ClassPathScanningCandidateComponentProvider;
 import org.springframework.core.type.filter.RegexPatternTypeFilter;
+import org.springframework.data.annotation.Id;
 import org.springframework.data.mongodb.core.convert.MongoCustomConversions;
 import org.springframework.data.mongodb.core.mapping.MongoMappingContext;
 import org.springframework.data.mongodb.core.schema.MongoJsonSchema;
@@ -30,22 +31,32 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Predicate;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
  * Genere le $jsonSchema MongoDB de la collection "actors" a partir du modele Java (Actor)
  * et reprend les descriptions deja presentes sur les DTO (@Schema(description = "...")).
  *
- * Le lien modele -> DTO est decouvert via les mappers MapStruct (ActorMapper, AddressMapper,
- * ContactMapper, ...) : chaque methode de mapper relie une classe du modele a une classe DTO.
+ * Comment retrouver le bon DTO / le bon champ :
+ *  1. ActorMapper : on lit ses @Mapping (target/source) pour relier un chemin du modele
+ *     (ex. "personalIdentity.firstName" dans ActorInActivity) a un champ de DTO plat
+ *     (ex. ActorDto.firstName). Les annotations MapStruct ne sont pas visibles par reflexion
+ *     (retention CLASS) : on parse donc le fichier source ActorMapper.java.
+ *  2. Les autres mappers (AddressMapper, ContactMapper, ...) : decouverts par scan, ils relient
+ *     une classe du modele a son DTO (champs de meme nom).
+ *  3. Secours : champ de meme nom dans le DTO, puis @Schema sur le modele.
  *
- * NB : cette classe doit vivre dans un module qui voit a la fois le modele (core)
- * et les DTO / mappers (business).
+ * NB : a lancer depuis la racine du module (chemins relatifs src/main/...).
  */
 public final class SchemaExporter {
 
     public static final Path TARGET =
             Path.of("src/main/resources/schema/mongodb/actors/1.0.0.json5");
+
+    /** Source de l'ActorMapper (parse pour lire les @Mapping). */
+    private static final Path ACTOR_MAPPER_SOURCE = Path.of(
+            "src/main/java/com/rcibs/rdv/api/business/corp/service/actors/mapper/ActorMapper.java");
 
     /** Racine du code applicatif scannee pour trouver les mappers (*Mapper). */
     private static final String BASE_PACKAGE = "com.rcibs.rdv.api";
@@ -63,6 +74,28 @@ public final class SchemaExporter {
             .indentCharacters("    ")
             .build();
 
+    // Parsing de ActorMapper.java
+    private static final Pattern MAPPING = Pattern.compile("@Mapping\\(([^)]*)\\)");
+    private static final Pattern DECLARATION =
+            Pattern.compile("([\\w.<>\\[\\]]+)\\s+(\\w+)\\s*\\(([^()]*)\\)\\s*;");
+    private static final Pattern ATTR_TARGET = Pattern.compile("target\\s*=\\s*\"([^\"]+)\"");
+    private static final Pattern ATTR_SOURCE = Pattern.compile("source\\s*=\\s*\"([^\"]+)\"");
+
+    /** Champ de DTO (classe + nom) qui documente un champ du modele. */
+    private record DtoRef(Class<?> dto, String field) {
+    }
+
+    private record MappingEntry(int start, String target, String source) {
+    }
+
+    /**
+     * registry : classe du modele -> DTO associes (scan des mappers)
+     * explicit : classe "racine" du modele (Actor, ActorInActivity) -> chemin -> champs de DTO
+     */
+    private record Context(Map<Class<?>, Set<Class<?>>> registry,
+                           Map<Class<?>, Map<String, List<DtoRef>>> explicit) {
+    }
+
     private SchemaExporter() {
     }
 
@@ -78,14 +111,13 @@ public final class SchemaExporter {
         Document root = schema.toDocument();
         Document jsonSchema = root.get("$jsonSchema", Document.class);
 
-        Map<Class<?>, Set<Class<?>>> registry = discoverMapperPairs();
+        Context context = new Context(discoverMapperPairs(), parseActorMapper());
 
-        // Racine : ActorDto en premier, puis tout DTO que les mappers associent a Actor.
         Set<Class<?>> rootDtos = new LinkedHashSet<>();
         rootDtos.add(ActorDto.class);
-        rootDtos.addAll(registry.getOrDefault(Actor.class, Set.of()));
+        rootDtos.addAll(context.registry().getOrDefault(Actor.class, Set.of()));
 
-        enrich(jsonSchema, Actor.class, rootDtos, registry);
+        enrich(jsonSchema, Actor.class, rootDtos, context, Actor.class, "");
         addRootExtras(jsonSchema);
         return root;
     }
@@ -105,14 +137,149 @@ public final class SchemaExporter {
         System.out.println("Schema ecrit dans " + target.toAbsolutePath());
     }
 
+    // ------------------------------------------- lecture des @Mapping de ActorMapper
+
+    private static Map<Class<?>, Map<String, List<DtoRef>>> parseActorMapper() {
+        Map<Class<?>, Map<String, List<DtoRef>>> explicit = new LinkedHashMap<>();
+
+        String source;
+        try {
+            source = Files.readString(ACTOR_MAPPER_SOURCE, StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new IllegalStateException("ActorMapper.java introuvable : "
+                    + ACTOR_MAPPER_SOURCE.toAbsolutePath()
+                    + " (lancer depuis la racine du module)", e);
+        }
+        // supprime les commentaires (// Enum, // Sub-resources, ...)
+        source = source.replaceAll("(?s)/\\*.*?\\*/", "").replaceAll("//[^\\n]*", "");
+
+        List<MappingEntry> mappings = new ArrayList<>();
+        Matcher mm = MAPPING.matcher(source);
+        while (mm.find()) {
+            String attributes = mm.group(1);
+            String target = firstGroup(ATTR_TARGET, attributes);
+            String src = firstGroup(ATTR_SOURCE, attributes);
+            if (target != null && src != null) { // ignore = true sans source : sans interet
+                mappings.add(new MappingEntry(mm.start(), target, src));
+            }
+        }
+
+        // Les @Mapping precedent la methode abstraite qu'ils decrivent.
+        Matcher dm = DECLARATION.matcher(source);
+        int previousEnd = 0;
+        while (dm.find()) {
+            int from = previousEnd;
+            int to = dm.start();
+            previousEnd = dm.end();
+
+            Method method = findMapperMethod(dm.group(2));
+            if (method == null) {
+                continue;
+            }
+            List<String> paramNames = parameterNames(dm.group(3));
+            for (MappingEntry entry : mappings) {
+                if (entry.start() >= from && entry.start() < to) {
+                    register(explicit, method, paramNames, entry);
+                }
+            }
+        }
+
+        // Valeurs posees dans les @AfterMapping (enums) : pas de @Mapping a lire.
+        Method toModel = findMapperMethod("toModel");
+        if (toModel != null) {
+            Class<?> activity = toModel.getReturnType();
+            addExplicit(explicit, activity, "name", ActorDto.class, "activityName");
+            addExplicit(explicit, activity, "activityRole", ActorDto.class, "activityRole");
+            addExplicit(explicit, activity, "personalIdentity.title", ActorDto.class, "title");
+            addExplicit(explicit, activity, "personalIdentity.civility", ActorDto.class, "civility");
+            addExplicit(explicit, activity, "personalIdentity.rciUserId", ActorDto.class, "rciUserId");
+        }
+        addExplicit(explicit, Actor.class, "type", ActorDto.class, "actorType");
+
+        return explicit;
+    }
+
+    private static void register(Map<Class<?>, Map<String, List<DtoRef>>> explicit,
+                                 Method method,
+                                 List<String> paramNames,
+                                 MappingEntry entry) {
+        Class<?> returned = unwrap(method.getGenericReturnType());
+        Class<?>[] params = method.getParameterTypes();
+
+        if (isModel(returned)) {
+            // DTO -> modele : target = chemin modele, source = champ du DTO
+            for (Class<?> param : params) {
+                if (isDto(param)) {
+                    addExplicit(explicit, returned, entry.target(), param, entry.source());
+                }
+            }
+        } else if (isDto(returned)) {
+            // modele -> DTO : target = champ du DTO, source = "<parametre>.<chemin modele>"
+            int dot = entry.source().indexOf('.');
+            if (dot < 0) {
+                return;
+            }
+            int index = paramNames.indexOf(entry.source().substring(0, dot));
+            if (index < 0 || index >= params.length || !isModel(params[index])) {
+                return;
+            }
+            addExplicit(explicit, params[index], entry.source().substring(dot + 1),
+                    returned, entry.target());
+        }
+    }
+
+    private static void addExplicit(Map<Class<?>, Map<String, List<DtoRef>>> explicit,
+                                    Class<?> modelClass, String path,
+                                    Class<?> dto, String dtoField) {
+        List<DtoRef> refs = explicit
+                .computeIfAbsent(modelClass, k -> new LinkedHashMap<>())
+                .computeIfAbsent(path, k -> new ArrayList<>());
+        DtoRef ref = new DtoRef(dto, dtoField);
+        if (!refs.contains(ref)) {
+            refs.add(ref);
+        }
+    }
+
+    private static Method findMapperMethod(String name) {
+        for (Method m : ActorMapper.class.getMethods()) {
+            if (m.getName().equals(name)) {
+                return m;
+            }
+        }
+        return null;
+    }
+
+    /** "Actor actor, @Context ReferenceService referenceService" -> [actor, referenceService] */
+    private static List<String> parameterNames(String parameters) {
+        List<String> names = new ArrayList<>();
+        for (String parameter : parameters.split(",")) {
+            String[] tokens = parameter.trim().split("\\s+");
+            names.add(tokens[tokens.length - 1]);
+        }
+        return names;
+    }
+
+    private static String firstGroup(Pattern pattern, String text) {
+        Matcher m = pattern.matcher(text);
+        return m.find() ? m.group(1) : null;
+    }
+
+    private static boolean isModel(Class<?> c) {
+        return c != null && c.getName().startsWith(MODEL_PACKAGE);
+    }
+
+    private static boolean isDto(Class<?> c) {
+        return c != null
+                && c.getName().startsWith(BASE_PACKAGE)
+                && !isModel(c)
+                && (c.getName().contains(".dto.") || c.getSimpleName().endsWith("Dto"));
+    }
+
     // ---------------------------------------------------- decouverte mappers
 
     /**
      * Scanne les interfaces/classes "*Mapper" et deduit, pour chaque methode, les couples
      * (classe du modele -> classes DTO) a partir du type de retour et des parametres.
-     *
-     * On scanne au lieu de lire @Mapper(uses = ...) car l'annotation MapStruct a une retention
-     * CLASS : elle n'est pas lisible par reflexion a l'execution.
      */
     private static Map<Class<?>, Set<Class<?>>> discoverMapperPairs() {
         Map<Class<?>, Set<Class<?>>> result = new LinkedHashMap<>();
@@ -144,12 +311,9 @@ public final class SchemaExporter {
                 Set<Class<?>> dtos = new LinkedHashSet<>();
                 for (Type type : types) {
                     Class<?> c = unwrap(type);
-                    if (c == null) {
-                        continue;
-                    }
-                    if (c.getName().startsWith(MODEL_PACKAGE)) {
+                    if (isModel(c)) {
                         models.add(c);
-                    } else if (c.getName().startsWith(BASE_PACKAGE)) {
+                    } else if (isDto(c)) {
                         dtos.add(c);
                     }
                 }
@@ -188,14 +352,18 @@ public final class SchemaExporter {
     }
 
     /**
-     * Parcourt le schema en parallele de la classe du modele et des classes DTO candidates.
-     * Candidats d'un noeud = DTO donnes par les mappers pour ce type de modele
-     * + type du champ correspondant dans les DTO du noeud parent.
+     * Parcourt le schema en parallele du modele.
+     *
+     * @param scope classe "racine" courante (Actor ou ActorInActivity) : les chemins des @Mapping
+     *              sont relatifs a elle
+     * @param path  chemin du noeud courant depuis scope (ex. "personalIdentity")
      */
     private static void enrich(Document node,
                                Class<?> modelClass,
                                Set<Class<?>> dtoCandidates,
-                               Map<Class<?>, Set<Class<?>>> registry) {
+                               Context ctx,
+                               Class<?> scope,
+                               String path) {
         normalizeType(node);
         Document props = node.get("properties", Document.class);
         if (props == null) {
@@ -215,14 +383,8 @@ public final class SchemaExporter {
                 continue;
             }
 
-            // Champs correspondants dans chacun des DTO candidats
-            List<Field> dtoFields = new ArrayList<>();
-            for (Class<?> dto : dtoCandidates) {
-                Field f = findDtoField(dto, modelField.getName());
-                if (f != null) {
-                    dtoFields.add(f);
-                }
-            }
+            String key = path.isEmpty() ? modelField.getName() : path + "." + modelField.getName();
+            List<Field> dtoFields = resolveDtoFields(ctx, scope, key, dtoCandidates, modelField.getName());
 
             String description = null;
             for (Field f : dtoFields) {
@@ -240,13 +402,7 @@ public final class SchemaExporter {
 
             Object bsonType = prop.get("bsonType");
             if ("object".equals(bsonType)) {
-                Set<Class<?>> children = new LinkedHashSet<>();
-                for (Field f : dtoFields) {
-                    addCandidate(children, f.getType());
-                }
-                children.addAll(registry.getOrDefault(modelField.getType(), Set.of()));
-                enrich(prop, modelField.getType(), children, registry);
-
+                descend(prop, modelField.getType(), dtoFields, false, ctx, scope, key);
             } else if ("array".equals(bsonType)) {
                 Document items = prop.get("items", Document.class);
                 if (items == null) {
@@ -254,17 +410,49 @@ public final class SchemaExporter {
                 }
                 normalizeType(items);
                 Class<?> modelElement = elementType(modelField.getGenericType());
-                if (modelElement == null) {
-                    continue;
+                if (modelElement != null) {
+                    descend(items, modelElement, dtoFields, true, ctx, scope, key);
                 }
-                Set<Class<?>> children = new LinkedHashSet<>();
-                for (Field f : dtoFields) {
-                    addCandidate(children, elementType(f.getGenericType()));
-                }
-                children.addAll(registry.getOrDefault(modelElement, Set.of()));
-                enrich(items, modelElement, children, registry);
             }
         }
+    }
+
+    /** Champs de DTO documentant ce champ : d'abord via @Mapping, puis par nom identique. */
+    private static List<Field> resolveDtoFields(Context ctx, Class<?> scope, String key,
+                                                Set<Class<?>> dtoCandidates, String javaName) {
+        List<Field> fields = new ArrayList<>();
+
+        List<DtoRef> refs = ctx.explicit()
+                .getOrDefault(scope, Map.of())
+                .getOrDefault(key, List.of());
+        for (DtoRef ref : refs) {
+            Field f = findDtoField(ref.dto(), ref.field());
+            if (f != null && !fields.contains(f)) {
+                fields.add(f);
+            }
+        }
+        for (Class<?> dto : dtoCandidates) {
+            Field f = findDtoField(dto, javaName);
+            if (f != null && !fields.contains(f)) {
+                fields.add(f);
+            }
+        }
+        return fields;
+    }
+
+    private static void descend(Document node, Class<?> childModel, List<Field> dtoFields,
+                                boolean element, Context ctx, Class<?> scope, String key) {
+        Set<Class<?>> children = new LinkedHashSet<>();
+        for (Field f : dtoFields) {
+            addCandidate(children, element ? elementType(f.getGenericType()) : f.getType());
+        }
+        children.addAll(ctx.registry().getOrDefault(childModel, Set.of()));
+
+        // Une classe qui a ses propres @Mapping (ex. ActorInActivity) ouvre un nouveau scope.
+        boolean newScope = ctx.explicit().containsKey(childModel);
+        enrich(node, childModel, children, ctx,
+                newScope ? childModel : scope,
+                newScope ? "" : key);
     }
 
     /** Ne garde que les classes applicatives (evite String, List, etc.). */
@@ -304,7 +492,7 @@ public final class SchemaExporter {
         return schema != null && !schema.description().isBlank() ? schema.description() : null;
     }
 
-    /** Champ du modele : par nom Java ou par nom Mongo (@Field). */
+    /** Champ du modele : par nom Java ou par nom Mongo (@Field, @Id -> _id). */
     private static Field findModelField(Class<?> type, String mongoName) {
         return findField(type, f -> f.getName().equals(mongoName) || mongoName(f).equals(mongoName));
     }
@@ -339,6 +527,9 @@ public final class SchemaExporter {
             if (!v.isEmpty()) {
                 return v;
             }
+        }
+        if (f.isAnnotationPresent(Id.class) || f.getName().equals("id")) {
+            return "_id";
         }
         return f.getName();
     }
