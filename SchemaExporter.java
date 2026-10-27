@@ -6,13 +6,19 @@ import io.swagger.v3.oas.annotations.media.Schema;
 import org.bson.Document;
 import org.bson.json.JsonMode;
 import org.bson.json.JsonWriterSettings;
+import org.springframework.beans.factory.annotation.AnnotatedBeanDefinition;
+import org.springframework.beans.factory.config.BeanDefinition;
+import org.springframework.context.annotation.ClassPathScanningCandidateComponentProvider;
+import org.springframework.core.type.filter.RegexPatternTypeFilter;
 import org.springframework.data.mongodb.core.convert.MongoCustomConversions;
 import org.springframework.data.mongodb.core.mapping.MongoMappingContext;
 import org.springframework.data.mongodb.core.schema.MongoJsonSchema;
 import org.springframework.data.mongodb.core.schema.MongoJsonSchemaCreator;
+import org.springframework.util.ClassUtils;
 
 import java.io.IOException;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
@@ -20,21 +26,36 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Predicate;
+import java.util.regex.Pattern;
 
 /**
  * Genere le $jsonSchema MongoDB de la collection "actors" a partir du modele Java (Actor)
- * et reprend les descriptions deja presentes sur le DTO (@Schema(description = "...")).
+ * et reprend les descriptions deja presentes sur les DTO (@Schema(description = "...")).
+ *
+ * Le lien modele -> DTO est decouvert via les mappers MapStruct (ActorMapper, AddressMapper,
+ * ContactMapper, ...) : chaque methode de mapper relie une classe du modele a une classe DTO.
  *
  * NB : cette classe doit vivre dans un module qui voit a la fois le modele (core)
- * et les DTO (business).
+ * et les DTO / mappers (business).
  */
 public final class SchemaExporter {
 
     public static final Path TARGET =
             Path.of("src/main/resources/schema/mongodb/actors/1.0.0.json5");
+
+    /** Racine du code applicatif scannee pour trouver les mappers (*Mapper). */
+    private static final String BASE_PACKAGE = "com.rcibs.rdv.api";
+
+    /** Package des classes du modele Mongo (cote "entite" des mappers). */
+    private static final String MODEL_PACKAGE = "com.rcibs.rdv.api.core.model";
 
     /** Champs obligatoires (ceux du schema actuel). */
     private static final List<String> REQUIRED =
@@ -61,7 +82,14 @@ public final class SchemaExporter {
         Document root = schema.toDocument();
         Document jsonSchema = root.get("$jsonSchema", Document.class);
 
-        enrich(jsonSchema, Actor.class, ActorDto.class);
+        Map<Class<?>, Set<Class<?>>> registry = discoverMapperPairs();
+
+        // Racine : ActorDto en premier, puis tout DTO que les mappers associent a Actor.
+        Set<Class<?>> rootDtos = new LinkedHashSet<>();
+        rootDtos.add(ActorDto.class);
+        rootDtos.addAll(registry.getOrDefault(Actor.class, Set.of()));
+
+        enrich(jsonSchema, Actor.class, rootDtos, registry);
         addRootExtras(jsonSchema);
         return root;
     }
@@ -81,6 +109,77 @@ public final class SchemaExporter {
         System.out.println("Schema ecrit dans " + target.toAbsolutePath());
     }
 
+    // ---------------------------------------------------- decouverte mappers
+
+    /**
+     * Scanne les interfaces/classes "*Mapper" et deduit, pour chaque methode, les couples
+     * (classe du modele -> classes DTO) a partir du type de retour et des parametres.
+     *
+     * On scanne au lieu de lire @Mapper(uses = ...) car l'annotation MapStruct a une retention
+     * CLASS : elle n'est pas lisible par reflexion a l'execution.
+     */
+    private static Map<Class<?>, Set<Class<?>>> discoverMapperPairs() {
+        Map<Class<?>, Set<Class<?>>> result = new LinkedHashMap<>();
+
+        ClassPathScanningCandidateComponentProvider scanner =
+                new ClassPathScanningCandidateComponentProvider(false) {
+                    @Override
+                    protected boolean isCandidateComponent(AnnotatedBeanDefinition beanDefinition) {
+                        return beanDefinition.getMetadata().isIndependent(); // autorise les interfaces
+                    }
+                };
+        scanner.addIncludeFilter(new RegexPatternTypeFilter(Pattern.compile(".*Mapper$")));
+
+        ClassLoader classLoader = SchemaExporter.class.getClassLoader();
+        for (BeanDefinition definition : scanner.findCandidateComponents(BASE_PACKAGE)) {
+            Class<?> mapper;
+            try {
+                mapper = ClassUtils.forName(definition.getBeanClassName(), classLoader);
+            } catch (ClassNotFoundException | LinkageError e) {
+                continue;
+            }
+
+            for (Method method : mapper.getMethods()) {
+                List<Type> types = new ArrayList<>();
+                types.add(method.getGenericReturnType());
+                types.addAll(Arrays.asList(method.getGenericParameterTypes()));
+
+                Set<Class<?>> models = new LinkedHashSet<>();
+                Set<Class<?>> dtos = new LinkedHashSet<>();
+                for (Type type : types) {
+                    Class<?> c = unwrap(type);
+                    if (c == null) {
+                        continue;
+                    }
+                    if (c.getName().startsWith(MODEL_PACKAGE)) {
+                        models.add(c);
+                    } else if (c.getName().startsWith(BASE_PACKAGE)) {
+                        dtos.add(c);
+                    }
+                }
+                for (Class<?> model : models) {
+                    result.computeIfAbsent(model, k -> new LinkedHashSet<>()).addAll(dtos);
+                }
+            }
+        }
+        return result;
+    }
+
+    /** List<X>, Set<X>, Optional<X>, X[] -> X ; X -> X ; le reste -> null. */
+    private static Class<?> unwrap(Type type) {
+        if (type instanceof Class<?> c) {
+            return c.isArray() ? unwrap(c.getComponentType()) : c;
+        }
+        if (type instanceof ParameterizedType p && p.getRawType() instanceof Class<?> raw) {
+            boolean wrapper = Iterable.class.isAssignableFrom(raw) || Optional.class.equals(raw);
+            if (wrapper && p.getActualTypeArguments().length == 1) {
+                return unwrap(p.getActualTypeArguments()[0]);
+            }
+            return raw;
+        }
+        return null;
+    }
+
     // ------------------------------------------------------- post-traitement
 
     private static void addRootExtras(Document jsonSchema) {
@@ -93,10 +192,14 @@ public final class SchemaExporter {
     }
 
     /**
-     * Parcourt le schema en parallele de la classe du modele et de la classe DTO correspondante.
-     * dtoClass peut etre null (pas de DTO equivalent) : on tente alors @Schema du modele.
+     * Parcourt le schema en parallele de la classe du modele et des classes DTO candidates.
+     * Candidats d'un noeud = DTO donnes par les mappers pour ce type de modele
+     * + type du champ correspondant dans les DTO du noeud parent.
      */
-    private static void enrich(Document node, Class<?> modelClass, Class<?> dtoClass) {
+    private static void enrich(Document node,
+                               Class<?> modelClass,
+                               Set<Class<?>> dtoCandidates,
+                               Map<Class<?>, Set<Class<?>>> registry) {
         normalizeType(node);
         Document props = node.get("properties", Document.class);
         if (props == null) {
@@ -104,21 +207,34 @@ public final class SchemaExporter {
         }
         for (String propName : new ArrayList<>(props.keySet())) {
             Document prop = props.get(propName, Document.class);
-            Field modelField = findModelField(modelClass, propName);
             if (prop == null) {
                 continue;
             }
             // Le creator Spring emet "type": "string|array|object" (JSON Schema) pour les types
-            // simples et "bsonType" pour les autres : on uniformise AVANT de lire le type,
-            // sinon la descente dans les listes/objets imbriques est sautee.
+            // simples et "bsonType" pour les autres : on uniformise AVANT de lire le type.
             normalizeType(prop);
+
+            Field modelField = findModelField(modelClass, propName);
             if (modelField == null) {
                 continue;
             }
 
-            Field dtoField = dtoClass == null ? null : findDtoField(dtoClass, modelField.getName());
+            // Champs correspondants dans chacun des DTO candidats
+            List<Field> dtoFields = new ArrayList<>();
+            for (Class<?> dto : dtoCandidates) {
+                Field f = findDtoField(dto, modelField.getName());
+                if (f != null) {
+                    dtoFields.add(f);
+                }
+            }
 
-            String description = descriptionOf(dtoField);
+            String description = null;
+            for (Field f : dtoFields) {
+                description = descriptionOf(f);
+                if (description != null) {
+                    break;
+                }
+            }
             if (description == null) {
                 description = descriptionOf(modelField); // fallback : @Schema sur le modele
             }
@@ -128,18 +244,37 @@ public final class SchemaExporter {
 
             Object bsonType = prop.get("bsonType");
             if ("object".equals(bsonType)) {
-                enrich(prop, modelField.getType(), dtoField == null ? null : dtoField.getType());
+                Set<Class<?>> children = new LinkedHashSet<>();
+                for (Field f : dtoFields) {
+                    addCandidate(children, f.getType());
+                }
+                children.addAll(registry.getOrDefault(modelField.getType(), Set.of()));
+                enrich(prop, modelField.getType(), children, registry);
+
             } else if ("array".equals(bsonType)) {
                 Document items = prop.get("items", Document.class);
-                if (items != null) {
-                    normalizeType(items);
+                if (items == null) {
+                    continue;
                 }
+                normalizeType(items);
                 Class<?> modelElement = elementType(modelField.getGenericType());
-                Class<?> dtoElement = dtoField == null ? null : elementType(dtoField.getGenericType());
-                if (items != null && modelElement != null) {
-                    enrich(items, modelElement, dtoElement);
+                if (modelElement == null) {
+                    continue;
                 }
+                Set<Class<?>> children = new LinkedHashSet<>();
+                for (Field f : dtoFields) {
+                    addCandidate(children, elementType(f.getGenericType()));
+                }
+                children.addAll(registry.getOrDefault(modelElement, Set.of()));
+                enrich(items, modelElement, children, registry);
             }
+        }
+    }
+
+    /** Ne garde que les classes applicatives (evite String, List, etc.). */
+    private static void addCandidate(Set<Class<?>> candidates, Class<?> type) {
+        if (type != null && type.getName().startsWith(BASE_PACKAGE)) {
+            candidates.add(type);
         }
     }
 
