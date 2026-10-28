@@ -1,0 +1,34 @@
+<plugin>
+  <groupId>org.codehaus.mojo</groupId>
+  <artifactId>exec-maven-plugin</artifactId>
+  <version>3.1.0</version>
+  <executions>
+    <execution>
+      <id>generate-mongo-schema</id>
+      <phase>process-classes</phase>
+      <goals><goal>java</goal></goals>
+      <configuration>
+        <mainClass>com.rcibs.rdv.api.business.corp.schema.SchemaExporter</mainClass>
+        <classpathScope>compile</classpathScope>
+        <systemProperties>
+          <systemProperty>
+            <key>schema.version</key>
+            <value>${schema.version}</value>
+          </systemProperty>
+        </systemProperties>
+      </configuration>
+    </execution>
+  </executions>
+</plugin>
+
+<!-- Recopie le schéma généré dans target/classes (donc dans le jar) -->
+<plugin>
+  <artifactId>maven-resources-plugin</artifactId>
+  <executions>
+    <execution>
+      <id>copy-generated-schema</id>
+      <phase>process-classes</phase>
+      <goals><goal>resources</goal></goals>
+    </execution>
+  </executions>
+</plugin>
