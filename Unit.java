@@ -1,6 +1,3 @@
-package com.rcibs.rdv.api.business.corp.schema;
-
-import com.rcibs.rdv.api.business.corp.service.actors.dto.ActorDto;
 import io.swagger.v3.oas.annotations.media.Schema;
 import org.bson.Document;
 import org.bson.json.JsonMode;
