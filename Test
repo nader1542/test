@@ -1,0 +1,4 @@
+( #model2.type != 'PARKING' && #model1.status == #model2.status && #model1.type == #model2.type ) &&
+( #model1.externalIds == null || #model1.externalIds.isEmpty() || #model2.externalIds == null || #model2.externalIds.isEmpty() ||
+  ( #model1.externalIds.?[ name != null && value != null && application != null && application.name != null ].![ name + '|' + value + '|' + application.name ].containsAll(#model2.externalIds.?[ name != null && value != null && application != null && application.name != null ].![ name + '|' + value + '|' + application.name ])
+    && #model2.externalIds.?[ name != null && value != null && application != null && application.name != null ].![ name + '|' + value + '|' + application.name ].containsAll(#model1.externalIds.?[ name != null && value != null && application != null && application.name != null ].![ name + '|' + value + '|' + application.name ]) ) )
