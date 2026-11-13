@@ -1,0 +1,127 @@
+package com.rcibs.rdv.api.config.dbmigrations;
+
+import com.rcibs.rdv.tools.dynamicproperties.model.DynamicProperty;
+import io.mongock.api.annotations.BeforeExecution;
+import io.mongock.api.annotations.ChangeUnit;
+import io.mongock.api.annotations.Execution;
+import io.mongock.api.annotations.RollbackBeforeExecution;
+import io.mongock.api.annotations.RollbackExecution;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.query.Query;
+
+import java.util.List;
+import java.util.Set;
+import java.util.function.Function;
+
+import static org.springframework.data.mongodb.core.query.Criteria.where;
+
+/**
+ * MFSRDV-845 : externalId sub-resources - unicity rules.
+ *
+ * Takes the value already stored for each setting of the listed sub-resources (default + IT / ES / PT)
+ * and only adds the externalIds part:
+ *   ( existing value ) &&
+ *   ( no externalIds on one side || same set of externalIds on both sides )
+ *
+ * - Idempotent: a value already containing the externalIds part is left unchanged.
+ * - Rules equal to "true" / "false" are left unchanged.
+ * - Rollback strips the added part and restores the existing value (leading / trailing spaces and line breaks of
+ *   the original value are not restored, which does not change the SpEL result).
+ *
+ * CHECK before running: each sub-resource below must have a "List<ExternalIdentifier> externalIds" field
+ * (confirmed for Address only). Otherwise the rule fails with EL1008E at runtime.
+ */
+@Slf4j
+@ChangeUnit(id = "set-sub-resource-uniqueness-rules", order = "0166")
+public class Z166SetSubResourceUniquenessRules {
+
+    private static final String PROPERTY_NAME = "ACTOR_SUBRESOURCE_CREATION_FUNCTIONAL_UNIQUENESS_RULE";
+    private static final String SUB_RESOURCE_FILTER = "subResource";
+
+    private static final Set<String> SUB_RESOURCES = Set.of(
+            "addresses", "contacts", "consents", "employments", "bankAccounts", "identityDocuments");
+
+    // Complete externalIds only, projected to "name|value|application.name" keys.
+    private static final Function<String, String> KEYS = model -> "#" + model
+            + ".externalIds.?[ name != null && value != null && application != null && application.name != null ]"
+            + ".![ name + '|' + value + '|' + application.name ]";
+
+    // True when one side has no externalIds (legacy data) or when both sides hold exactly the same keys.
+    private static final String EXTERNAL_ID_MATCH =
+            "#model1.externalIds == null || #model1.externalIds.isEmpty() "
+                    + "|| #model2.externalIds == null || #model2.externalIds.isEmpty() "
+                    + "|| ( " + KEYS.apply("model1") + ".containsAll(" + KEYS.apply("model2") + ") "
+                    + "&& " + KEYS.apply("model2") + ".containsAll(" + KEYS.apply("model1") + ") )";
+
+    private static final String PREFIX = "( ";
+    private static final String SUFFIX = " ) &&\n( " + EXTERNAL_ID_MATCH + " )";
+
+    private final MongoTemplate template;
+
+    public Z166SetSubResourceUniquenessRules(MongoTemplate template) {
+        this.template = template;
+    }
+
+    @BeforeExecution
+    public void execDDL() {
+    }
+
+    @RollbackBeforeExecution
+    public void rollbackBeforeExecution() {
+    }
+
+    @Execution
+    public void changeSet() {
+        log.info("[DB_MIGRATION][Z166][PROPERTY] Start");
+        update(true);
+        log.info("[DB_MIGRATION][Z166][PROPERTY] End");
+    }
+
+    @RollbackExecution
+    public void rollback() {
+        log.info("[DB_MIGRATION][Z166][PROPERTY] Rollback Start");
+        update(false);
+        log.info("[DB_MIGRATION][Z166][PROPERTY] Rollback End");
+    }
+
+    private void update(boolean add) {
+        List<DynamicProperty> properties = template.find(
+                new Query(where("name").is(PROPERTY_NAME)), DynamicProperty.class);
+
+        if (properties.isEmpty()) {
+            log.error("[DB_MIGRATION][Z166][PROPERTY] Unable to find {} dynamic property", PROPERTY_NAME);
+            return;
+        }
+
+        properties.forEach(property -> {
+            property.getSettings().stream()
+                    .filter(setting -> setting.getFilters() != null
+                            && SUB_RESOURCES.contains(setting.getFilters().get(SUB_RESOURCE_FILTER)))
+                    .forEach(setting -> setting.setValue(
+                            add ? wrap(setting.getValue()) : unwrap(setting.getValue())));
+
+            log.info("[DB_MIGRATION][Z166][PROPERTY] Update property {} {} : Start", PROPERTY_NAME, property.getId());
+            template.save(property);
+            log.info("[DB_MIGRATION][Z166][PROPERTY] Update property {} {} : End", PROPERTY_NAME, property.getId());
+        });
+    }
+
+    private String wrap(String currentValue) {
+        if (currentValue == null) {
+            return null;
+        }
+        String current = currentValue.trim();
+        if (current.isEmpty() || "true".equals(current) || "false".equals(current) || current.endsWith(SUFFIX)) {
+            return currentValue;
+        }
+        return PREFIX + current + SUFFIX;
+    }
+
+    private String unwrap(String currentValue) {
+        if (currentValue != null && currentValue.startsWith(PREFIX) && currentValue.endsWith(SUFFIX)) {
+            return currentValue.substring(PREFIX.length(), currentValue.length() - SUFFIX.length());
+        }
+        return currentValue;
+    }
+}
